@@ -16,7 +16,7 @@ type ServiceEvent<T> = MessageEvent<
     }
 >;
 
-const commonChannel = new BroadcastChannel('common');
+const commonChannel = new BroadcastChannel('shared-snapshot-store-common-channel');
 
 const clientChannels = new Map<string, Map<string, BroadcastChannel>>();
 const getBroadcastChannelName = (clientId: string, serviceName: string) =>
@@ -40,7 +40,7 @@ const getClientId = async () => {
 export default (
   serviceName: string,
   target: { [method: string | symbol]: (...args: any[]) => any },
-  onProviderChange?: () => any
+  onProviderChange?: (isServiceProvider: Promise<boolean>) => any
 ) => {
   type TargetKey = keyof typeof target;
 
@@ -77,12 +77,12 @@ export default (
     return listener;
   };
 
-  let readyResolve: () => void;
+  let readyResolve: (() => void) | null = null;
   const status = {
     ready: new Promise<void>((resolve) => {
       readyResolve = resolve;
     }),
-    isServiceProvider: new Promise((resolve) => {
+    isServiceProvider: new Promise<boolean>((resolve) => {
       navigator.locks.query().then((locks) => {
         const isProvider = !locks.held?.find((lock) => lock.name === serviceName);
         resolve(isProvider);
@@ -117,8 +117,13 @@ export default (
       });
 
     commonChannel.addEventListener('message', async (event) => {
-      if (event.data.type === 'providerChange') {
-        await onProviderChange?.();
+      if (
+        event.data.type === 'providerChange' &&
+        event.data.serviceName === serviceName &&
+        !(await status.isServiceProvider)
+      ) {
+        console.log('Provider change detected. Re-registering with the new one...');
+        await onProviderChange?.(status.isServiceProvider);
         await register();
 
         if (requestsInFlight.size > 0) {
@@ -135,12 +140,16 @@ export default (
     await register();
 
     readyResolve?.();
+    readyResolve = null;
   };
 
   const onBecomeProvider = async () => {
-    status.ready = new Promise<void>((resolve) => {
-      readyResolve = resolve;
-    });
+    status.isServiceProvider = Promise.resolve(true);
+    if (readyResolve === null) {
+      status.ready = new Promise<void>((resolve) => {
+        readyResolve = resolve;
+      });
+    }
 
     commonChannel.addEventListener('message', async (event) => {
       const { clientId, type } = event.data;
@@ -179,9 +188,9 @@ export default (
       commonChannel.postMessage({ type: 'registered', clientId, serviceName });
     });
 
-    commonChannel.postMessage({ type: 'providerChange' });
+    commonChannel.postMessage({ type: 'providerChange', serviceName });
 
-    await onProviderChange?.();
+    await onProviderChange?.(status.isServiceProvider);
 
     if (requestsInFlight.size > 0) {
       console.log('Requests were in flight when this tab became the provider. Requeuing...');
@@ -198,10 +207,8 @@ export default (
       });
     }
 
-    console.log('Became provider');
-    status.isServiceProvider = Promise.resolve(true);
-
     readyResolve?.();
+    readyResolve = null;
   };
 
   const proxy = new Proxy(target, {
