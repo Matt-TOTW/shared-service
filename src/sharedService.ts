@@ -16,9 +16,6 @@ type ServiceEvent<T> = MessageEvent<
     }
 >;
 
-const commonChannel = new BroadcastChannel('shared-snapshot-store-common-channel');
-
-const clientChannels = new Map<string, Map<string, BroadcastChannel>>();
 const getBroadcastChannelName = (clientId: string, serviceName: string) =>
   `${clientId}-${serviceName}`;
 let broadcastChannel: BroadcastChannel | null = null;
@@ -43,6 +40,7 @@ export default (
   onProviderChange?: (isServiceProvider: Promise<boolean>) => any
 ) => {
   type TargetKey = keyof typeof target;
+  const commonChannel = new BroadcastChannel(`shared-service-common-channel-${serviceName}`);
 
   const requestsInFlight = new Map<
     string,
@@ -103,25 +101,17 @@ export default (
     const register = async () =>
       await new Promise<void>((resolve) => {
         const onRegisteredListener = (event: MessageEvent) => {
-          if (
-            event.data.clientId === clientId &&
-            event.data.serviceName === serviceName &&
-            event.data.type === 'registered'
-          ) {
+          if (event.data.clientId === clientId && event.data.type === 'registered') {
             commonChannel.removeEventListener('message', onRegisteredListener);
             resolve();
           }
         };
         commonChannel.addEventListener('message', onRegisteredListener);
-        commonChannel.postMessage({ type: 'register', clientId, serviceName });
+        commonChannel.postMessage({ type: 'register', clientId });
       });
 
     commonChannel.addEventListener('message', async (event) => {
-      if (
-        event.data.type === 'providerChange' &&
-        event.data.serviceName === serviceName &&
-        !(await status.isServiceProvider)
-      ) {
+      if (event.data.type === 'providerChange' && !(await status.isServiceProvider)) {
         console.log('Provider change detected. Re-registering with the new one...');
         await onProviderChange?.(status.isServiceProvider);
         await register();
@@ -155,20 +145,13 @@ export default (
       const { clientId, type } = event.data;
       if (type !== 'register') return;
 
+      const clientChannel = new BroadcastChannel(getBroadcastChannelName(clientId, serviceName));
       navigator.locks.request(clientId, { mode: 'exclusive' }, async () => {
         // The client has gone. Clean up
-        clientChannels.get(clientId)?.forEach((channel) => channel.close());
-        clientChannels.delete(clientId);
+        clientChannel.close();
       });
-      if (!clientChannels.has(clientId)) clientChannels.set(clientId, new Map());
 
-      clientChannels
-        .get(clientId)
-        ?.set(serviceName, new BroadcastChannel(getBroadcastChannelName(clientId, serviceName)));
-
-      const clientChannel = clientChannels.get(clientId)?.get(serviceName);
-
-      clientChannel?.addEventListener('message', async (event: ServiceEvent<TargetKey>) => {
+      clientChannel.addEventListener('message', async (event: ServiceEvent<TargetKey>) => {
         if (event.data.type === 'response') return;
         const { method, args, id } = event.data;
 
@@ -182,7 +165,7 @@ export default (
               : e;
         }
 
-        clientChannel?.postMessage({ id, type: 'response', result, error, method });
+        clientChannel.postMessage({ id, type: 'response', result, error, method });
       });
 
       commonChannel.postMessage({ type: 'registered', clientId, serviceName });
